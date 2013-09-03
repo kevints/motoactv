@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+import argparse
+from calendar import timegm
+from datetime import datetime, timedelta, timezone
+from functools import total_ordering
+from getpass import getpass
+from http.cookiejar import CookieJar
+from io import BytesIO
+import json
+import logging
+import netrc
+import os
+from random import random
+import sys
+from urllib.parse import urlencode
+from urllib.request import build_opener, HTTPCookieProcessor
+from zipfile import ZipFile
+
+
+log = logging.getLogger(__name__)
+
+
+MOTOACTV_DOMAIN = "motoactv.com"
+API_URL = "https://%s" % MOTOACTV_DOMAIN
+SESSION_LOGIN_URL = API_URL + "/session/login"
+MULTISPORT_DATA_URL = API_URL + "/data/pastAllWorkouts/multisport.json"
+WORKOUT_SHOW_URL = API_URL + "/workout/show"
+EXPORT_SINGLE_WORKOUT_URL = API_URL + "/export/exportSingleWorkoutData.json"
+DOWNLOAD_EXPORT_URL = API_URL + "/export/downloadExport"
+
+
+class MotoactvError(Exception):
+  pass
+
+
+class Motoactv(object):
+  def __init__(self, username, password, cookiejar=None, urlopener=None):
+    if cookiejar and urlopener:
+      raise ValueError('May only specify one of cookiejar or urlopener.')
+
+    self._username = username
+    self._password = password
+
+    if urlopener:
+      self._urlopener = urlopener
+    else:
+      cookie_processor = HTTPCookieProcessor(cookiejar or CookieJar())
+      self._urlopener = build_opener(cookie_processor)
+
+    self._is_logged_in = False
+
+  @property
+  def username():
+    return self._username
+
+  @property
+  def password():
+    return self._password
+
+  @property
+  def is_logged_in(self):
+    return self._is_logged_in
+
+  def login(self):
+    if self.is_logged_in:
+      raise MotoactvError("Already logged in.")
+
+    form_data = urlencode({
+      "screen_name": self._username,
+      "password": self._password,
+    }).encode('utf-8')
+
+    resp = self._urlopener.open(SESSION_LOGIN_URL, form_data)
+    resp_data = resp.read()
+    log.debug("Login response: %s" % resp_data)
+
+    self._is_logged_in = True
+
+  def past_workouts(self, start_date, end_date, previous=True):
+    if not self.is_logged_in:
+      self.login()
+
+    params = urlencode({
+      # startDate and endDate are milliseconds since epoch
+      "startDate": timegm(start_date.utctimetuple()) * 1000,
+      "endDate": timegm(end_date.utctimetuple()) * 1000,
+      # TODO: Figure out if these are necessary...
+      "previous": "true",
+      "rand": "%s" % random(),
+      "getall": "yep",
+    })
+
+    request_url = MULTISPORT_DATA_URL + "?" + params
+    log.debug(request_url)
+    resp = self._urlopener.open(request_url)
+
+    resp_data = resp.read()
+    log.debug('Received %d bytes.' % len(resp_data))
+    log.debug(resp.headers)
+    log.debug(resp_data)
+
+    workouts = json.loads(str(resp_data.decode('utf-8')))["pastWorkouts"]
+    return [Workout(**w) for w in workouts]
+
+  def export_tcx(self, activity_id, workoutdata_root):
+    if not self.is_logged_in:
+      self.login()
+
+    log.info("Exporting TCX for workout %s" % activity_id)
+    params = urlencode({
+      "activityId": activity_id,
+      "formats[]": "TCX",
+    }).encode('utf-8')
+
+    log.info("Requesting workout ID %s to be exported as TCX")
+    log.debug("POST %s %s" % (EXPORT_SINGLE_WORKOUT_URL, params))
+    resp = self._urlopener.open(EXPORT_SINGLE_WORKOUT_URL, params)
+
+    resp_data = resp.read()
+    log.debug("Response data: %s" % resp_data)
+    
+    export_result = json.loads(str(resp_data.decode('utf-8')))
+    export_id = export_result["exportID"]
+
+    params = urlencode({"exportID": export_id})
+    request_url = DOWNLOAD_EXPORT_URL + "?" + params
+    log.info("Downloading exported .zip file")
+    log.debug("GET %s" % request_url)
+    
+    resp = self._urlopener.open(request_url)
+
+    resp_data = resp.read()
+    log.debug("Response length: %d" % len(resp_data))
+    resp_buf = BytesIO(resp_data)
+
+    with ZipFile(resp_buf) as zf:
+      log.info(zf.namelist())
+      log.debug(zf.infolist())
+      zf.extractall(workoutdata_root)
+    
+
+@total_ordering
+class Workout(object):
+  @classmethod
+  def json_loads(cls, s):
+    return cls(**json.loads(s))
+
+  def __init__(self, **kws):
+    self._kws = kws
+
+  @property
+  def activity_id(self):
+    return self._kws["workoutActivityId"]
+
+  @property
+  def url(self):
+    params = urlencode({
+      "workoutActivityId": self.activity_id,
+      # TODO: Figure out what this means and why it's necessary.
+      "activity": "1"
+    })
+    return WORKOUT_SHOW_URL + "?" + params
+
+  @property
+  def start_time(self):
+    return datetime.fromtimestamp(self._kws["startTime"] / 1000, tz=timezone.utc)
+
+  @property
+  def end_time(self):
+    return datetime.fromtimestamp(self._kws["endTime"] / 1000, tz=timezone.utc)
+
+  # Workout_Sun_August 18, 2013 08_11_33_UTC.TCX
+  # XXX: Yes, it really uses 12-hr hour markers.
+  _FILENAME_FORMAT = "Workout_%a_%B %d, %Y %I_%M_%S_UTC.TCX"
+
+  @property
+  def tcx_filename(self):
+    """The TCX filename that would be generated by the Export feature on motoactv.com."""
+    return self.end_time.strftime(self._FILENAME_FORMAT)
+
+  def tcx_exists(self, workoutdata_root):
+    return os.path.exists(os.path.join(workoutdata_root, "workoutdata", "TCX", self.tcx_filename))
+    
+
+  @property
+  def duration_secs(self):
+    return self._kws["DURATION"]
+
+  def __repr__(self):
+    return "Workout(**%r)" % self._kws
+
+  def __str__(self):
+    return json.dumps(self._kws)
+
+  def __eq__(self, other):
+    if not isinstance(other, Workout):
+      return NotImplemented
+    return self._kws == other._kws
+
+  def __lt__(self, other):
+    if not isinstance(other, Workout):
+      return NotImplemented
+    return self.start_time < other.start_time
+    
+
+  def summary(self, workoutdata_root="."):
+    s =  "Start Time: %s\n"    % self.start_time
+    s += "End Time: %s\n"      % self.end_time
+    s += "  Activity ID:  %s\n" % self.activity_id
+    s += "  URL:          %s\n" % self.url
+    s += "  Distance:     %s\n" % self._kws["DISTANCE"]
+    s += "  Duration:     %s\n" % self.duration_secs
+    s += "  TCX Filename: %s\n" % self.tcx_filename
+    s += "  TCX Exists:   %s\n" % self.tcx_exists(workoutdata_root)
+    return s
+    
+
+DATE_FORMAT = "%Y-%m-%d"
+
+if __name__ == '__main__':
+  default_end_date = datetime.now()
+  default_start_date = default_end_date - timedelta(weeks=1)
+
+  parser = argparse.ArgumentParser(description="Query the MOTOACTV Portal.")
+  parser.add_argument("-n", "--netrc", type=argparse.FileType('r'), default=None,
+      help=".netrc-format file containing an entry for password. If not specified and the default "
+           ".netrc does not contain a usable entry user will be prompted.")
+  parser.add_argument("-v", "--verbose", action="store_true", default=False,
+      help="Enable verbose logging to STDERR.")
+  parser.add_argument("-q", "--quiet", action="store_true", default=False,
+      help="Don't log anything to STDERR.")
+  parser.add_argument("-s", "--start_date",
+      type=lambda s: datetime.strptime(s, DATE_FORMAT),
+      default=default_start_date,
+      help="Start date [default: one week ago (%s)]" % default_start_date.strftime(DATE_FORMAT))
+  parser.add_argument("-e", "--end_date",
+      type=lambda s: datetime.strptime(s, DATE_FORMAT),
+      default=default_end_date,
+      help="End date [default: today (%s)]" % default_end_date.strftime(DATE_FORMAT))
+  parser.add_argument("-w", "--workoutdata_root", default=".")
+  args = parser.parse_args()
+  try:
+    authenticators = netrc.netrc(args.netrc).hosts.get(MOTOACTV_DOMAIN)
+    if authenticators:
+      username, _, password = authenticators
+  except netrc.NetrcParseError as e:
+    if args.netrc:
+      print('Error parsing .netrc: %s' % e, file=sys.stderr)
+      sys.exit(1)
+    else:
+      print('Warning: Error parsing .netrc: %s' % e, file=sys.stderr)
+    
+      username = input("Username for motoactv.com: ")
+      password = getpass("Password for %s@motoactv.com: " % username)
+
+  level = 'SEVERE' if args.quiet else 'DEBUG' if args.verbose else 'INFO'
+  logging.basicConfig(level=level, format="%(asctime)s %(name)s:%(levelname)s %(msg)s")
+  motoactv = Motoactv(username=username, password=password)
+  motoactv.login()
+  workouts = motoactv.past_workouts(start_date=datetime.now() - timedelta(weeks=1), end_date=datetime.now())
+  for w in sorted(workouts):
+    print(w.summary(args.workoutdata_root))
+    if not w.tcx_exists(args.workoutdata_root):
+      print("Export TCX %s to %s" % (w.activity_id, args.workoutdata_root))
+      motoactv.export_tcx(w.activity_id, args.workoutdata_root)

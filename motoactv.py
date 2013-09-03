@@ -217,7 +217,7 @@ class Workout(object):
 
 DATE_FORMAT = "%Y-%m-%d"
 
-if __name__ == '__main__':
+def main():
   default_end_date = datetime.now()
   default_start_date = default_end_date - timedelta(weeks=1)
 
@@ -229,15 +229,18 @@ if __name__ == '__main__':
       help="Enable verbose logging to STDERR.")
   parser.add_argument("-q", "--quiet", action="store_true", default=False,
       help="Don't log anything to STDERR.")
-  parser.add_argument("-s", "--start_date",
+
+  subparsers = parser.add_subparsers()
+  fetch_parser = subparsers.add_parser('pull', help='Pull workout data from Motoactv portal.')
+  fetch_parser.add_argument("-s", "--start_date",
       type=lambda s: datetime.strptime(s, DATE_FORMAT),
       default=default_start_date,
       help="Start date [default: one week ago (%s)]" % default_start_date.strftime(DATE_FORMAT))
-  parser.add_argument("-e", "--end_date",
+  fetch_parser.add_argument("-e", "--end_date",
       type=lambda s: datetime.strptime(s, DATE_FORMAT),
       default=default_end_date,
       help="End date [default: today (%s)]" % default_end_date.strftime(DATE_FORMAT))
-  parser.add_argument("-w", "--workoutdata_root", default=".")
+  fetch_parser.add_argument("-w", "--workoutdata_root", default=".")
   args = parser.parse_args()
   try:
     authenticators = netrc.netrc(args.netrc).hosts.get(MOTOACTV_DOMAIN)
@@ -257,9 +260,12 @@ if __name__ == '__main__':
   logging.basicConfig(level=level, format="%(asctime)s %(name)s:%(levelname)s %(msg)s")
   motoactv = Motoactv(username=username, password=password)
   motoactv.login()
-  workouts = motoactv.past_workouts(start_date=datetime.now() - timedelta(weeks=1), end_date=datetime.now())
+  workouts = motoactv.past_workouts(start_date=args.start_date, end_date=args.end_date)
   for w in sorted(workouts):
     print(w.summary(args.workoutdata_root))
     if not w.tcx_exists(args.workoutdata_root):
       print("Export TCX %s to %s" % (w.activity_id, args.workoutdata_root))
       motoactv.export_tcx(w.activity_id, args.workoutdata_root)
+
+if __name__ == '__main__':
+  main()
